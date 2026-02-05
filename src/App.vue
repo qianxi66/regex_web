@@ -727,7 +727,6 @@ const astToString = (node) => {
 
 const isNullable = (node) => nullableFirstLast(node).nullable;
 
-const cloneAst = (node) => JSON.parse(JSON.stringify(node));
 
 const makeEps = () => ({ kind: 'eps' });
 const makeSym = (sym) => ({ kind: 'sym', sym });
@@ -897,6 +896,85 @@ ${edges.join('\n')}
 `;
 };
 
+const cloneAst = (node) => {
+  if (!node) return null;
+  if (node.kind === 'union') return { kind: 'union', left: cloneAst(node.left), right: cloneAst(node.right) };
+  if (node.kind === 'concat') return { kind: 'concat', left: cloneAst(node.left), right: cloneAst(node.right) };
+  if (node.kind === 'star') return { kind: 'star', child: cloneAst(node.child) };
+  return { ...node };
+};
+
+const collectUnionTerms = (node, terms = []) => {
+  if (node.kind === 'union') {
+    collectUnionTerms(node.left, terms);
+    collectUnionTerms(node.right, terms);
+  } else {
+    terms.push(node);
+  }
+  return terms;
+};
+
+const buildBalancedUnion = (terms) => {
+  if (terms.length === 0) return { kind: 'empty' };
+  if (terms.length === 1) return terms[0];
+  
+  const mid = Math.floor(terms.length / 2);
+  const left = buildBalancedUnion(terms.slice(0, mid));
+  const right = buildBalancedUnion(terms.slice(mid));
+  return { kind: 'union', left, right };
+};
+
+const normalizeAST = (node) => {
+  if (!node) return { kind: 'empty' };
+
+  if (node.kind === 'concat') {
+    const left = normalizeAST(node.left);
+    const right = normalizeAST(node.right);
+    
+    if (left.kind === 'empty' || right.kind === 'empty') return { kind: 'empty' };
+    
+    if (left.kind === 'eps') return right;
+    if (right.kind === 'eps') return left;
+
+    return { kind: 'concat', left, right };
+  }
+
+  if (node.kind === 'star') {
+    const child = normalizeAST(node.child);
+    // 优化：0* = eps, eps* = eps
+    if (child.kind === 'empty' || child.kind === 'eps') return { kind: 'eps' };
+    // 优化：(R*)* = R*
+    if (child.kind === 'star') return child; 
+    
+    return { kind: 'star', child };
+  }
+
+  if (node.kind === 'union') {
+    let terms = collectUnionTerms(node);
+    
+    terms = terms.map(normalizeAST);
+    terms = terms.filter(t => t.kind !== 'empty');
+
+    if (terms.length === 0) return { kind: 'empty' };
+
+    const uniqueMap = new Map();
+    terms.forEach(t => {
+      const s = astToString(t); 
+      if (!uniqueMap.has(s)) {
+        uniqueMap.set(s, t);
+      }
+    });
+    const sortedKeys = Array.from(uniqueMap.keys()).sort();
+    
+    if (sortedKeys.length === 1) return uniqueMap.get(sortedKeys[0]);
+
+    const sortedTerms = sortedKeys.map(k => uniqueMap.get(k));
+    return buildBalancedUnion(sortedTerms);
+  }
+
+  return node; // sym, eps, empty
+};
+
 const brz = (node, sym) => {
   if (!node) return { kind: 'empty' };
   if (node.kind === 'empty') return { kind: 'empty' };
@@ -922,36 +1000,62 @@ const brz = (node, sym) => {
 };
 
 const buildBrzDot = (regex, ast, alphabet) => {
-  const start = ast;
+  const start = normalizeAST(ast);
+  
   const queue = [start];
-  const visited = new Set([astToString(start)]);
+  const startKey = astToString(start);
+  const visited = new Set([startKey]);
+  
   const edges = [];
-  const nodes = [];
+  const nodesMap = new Map(); 
+  
+  nodesMap.set(startKey, { k: startKey, final: isNullable(start) });
+
   while (queue.length) {
     const cur = queue.shift();
     const curKey = astToString(cur);
-    const isFinal = isNullable(cur);
-    nodes.push({ k: curKey, final: isFinal });
+
     alphabet.forEach((sym) => {
-      const next = brz(cur, sym);
+      // 1. 计算导数
+      let next = brz(cur, sym);
+      
+      // 2. *** 关键修改：立即规范化 ***
+      // 这会把 (a|b)|c 变成 a|b|c，把 b|a 变成 a|b
+      next = normalizeAST(next);
+      
       const nk = astToString(next);
-      if (nk === '∅') return;
+      
+      // 忽略空集节点（除非你想画出死状态）
+      if (nk === '∅' || nk === 'empty') return;
+      
       edges.push(`  "${curKey}" -> "${nk}" [label="${sym}"];`);
+      
       if (edges.length > MAX_AUTOMATON_EDGES) {
-        throw new Error('Automaton too large.');
+        throw new Error('Automaton edges limit exceeded.');
       }
+      
       if (!visited.has(nk)) {
         visited.add(nk);
+        
+        // 记录节点属性
+        nodesMap.set(nk, { k: nk, final: isNullable(next) });
+        
         if (visited.size > MAX_AUTOMATON_STATES) {
-          throw new Error('Automaton too large.');
+          throw new Error('Automaton states limit exceeded.');
         }
+        
         queue.push(next);
       }
     });
   }
-  const nodeLines = nodes
-    .map((n) => `  "${n.k}" [label="${n.k}"${n.final ? ' peripheries=2' : ''}];`)
+
+  const nodeLines = Array.from(nodesMap.values())
+    .map((n) => {
+      const label = n.k.replace(/"/g, '\\"');
+      return `  "${n.k}" [label="${label}"${n.final ? ' peripheries=2' : ''}];`;
+    })
     .join('\n');
+
   return `
 digraph {
   rankdir=LR;
@@ -960,11 +1064,16 @@ digraph {
   fontsize=14;
   node [shape=box, style=filled, fillcolor="#e8f5e9", color="#2e7d32", fontcolor="#1b5e20"];
   edge [color="#1b5e20", penwidth=2, arrowsize=0.8];
+  
+  "${startKey}" [style="filled,bold", color="#1b5e20", fillcolor="#c8e6c9"];
+  
 ${nodeLines}
 ${edges.join('\n')}
 }
 `;
 };
+
+
 
 const buildPreDot = (regex, ast) => {
   const stateMap = new Map();
@@ -1213,12 +1322,16 @@ const parseDotToGraph = (dot) => {
   const initial = new Set();
   const lines = dot.split('\n');
 
+  // Regex to capture edge attributes
   const edgeRegex = /^\s*("?)(.+?)\1\s*->\s*("?)(.+?)\3(?:\s*\[([^\]]*)\])?/;
+  // Regex to capture node attributes
   const nodeRegex = /^\s*("?)(.+?)\1\s*\[([^\]]*)\]/;
 
   lines.forEach((line) => {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('digraph') || trimmed.startsWith('rankdir')) return;
+    
+    // Parse Edge
     const edgeMatch = trimmed.match(edgeRegex);
     if (edgeMatch) {
       const from = edgeMatch[2].trim();
@@ -1226,31 +1339,50 @@ const parseDotToGraph = (dot) => {
       const attrs = edgeMatch[5] || '';
       const labelMatch = attrs.match(/label="([^"]*)"/);
       const label = labelMatch ? labelMatch[1] : '';
-      if (from === 'start') {
+      
+      // Handle start node logic (initial state pointer)
+      if (from === 'start' || from === '__start0') { // classic graphviz patterns
         initial.add(to);
       } else {
         edges.push({ from, to, label });
       }
       return;
     }
+    
+    // Parse Node
     const nodeMatch = trimmed.match(nodeRegex);
     if (nodeMatch) {
       const id = nodeMatch[2].trim();
+      // Skip utility nodes
+      if (id === 'start' || id === '__start0' || id === 'node') return;
+
       const attrs = nodeMatch[3] || '';
       const labelMatch = attrs.match(/label="([^"]*)"/);
       const label = labelMatch ? labelMatch[1] : id;
-      const accept = /peripheries\s*=\s*2/.test(attrs);
+      
+      const isDoubleCircle = /peripheries\s*=\s*2/.test(attrs);
+      const isShapeDouble = /shape\s*=\s*"?doublecircle"?/.test(attrs);
+
+      const accept = isDoubleCircle || isShapeDouble;
+
       nodes.set(id, { id, label, accept });
     }
   });
 
+  // Ensure all edge endpoints exist in nodes (creates default node if definition is missing)
   edges.forEach((e) => {
+    if (['start', '__start0'].includes(e.from)) return;
+    
     if (!nodes.has(e.from)) nodes.set(e.from, { id: e.from, label: e.from, accept: false });
     if (!nodes.has(e.to)) nodes.set(e.to, { id: e.to, label: e.to, accept: false });
   });
 
+  // Fallback: If no initial state was found explicitly, pick the first defined node (often node 0)
   if (!initial.size && nodes.size) {
-    initial.add(nodes.keys().next().value);
+    // Attempt to find node "0" or "q0" first as a heuristic
+    if (nodes.has('0')) initial.add('0');
+    else if (nodes.has('q0')) initial.add('q0');
+    else initial.add(nodes.keys().next().value);
   }
 
   return { nodes, edges, initial };
@@ -1425,54 +1557,108 @@ const buildFallbackLayout = ({ nodes, edges, initial }) => {
 
 const buildTikzcd = ({ nodes, edges, initial }, layout) => {
   const layoutData = layout || buildFallbackLayout({ nodes, edges, initial });
-  const positions = layoutData.positions;
-  const totalRows = layoutData.rows;
-  const totalCols = layoutData.cols;
+  
+  // Shift positions
+  const positions = new Map();
+  layoutData.positions.forEach((pos, id) => {
+    positions.set(id, { row: pos.row + 1, col: pos.col + 1 });
+  });
 
+  const totalRows = layoutData.rows + 1;
+  const totalCols = layoutData.cols + 1;
+
+  // Initialize grid
   const rows = Array.from({ length: totalRows }, () => Array.from({ length: totalCols }, () => ''));
-  rows[0][0] = '{}';
 
+  // Fill nodes
   nodes.forEach((n) => {
     const pos = positions.get(n.id);
     if (!pos) return;
+
     const symbol = n.accept ? '\\bullet' : '\\circ';
-    const label = `\\mathrm{${normalizeId(n.id)}}`;
-    rows[pos.row - 1][pos.col - 1] = `${symbol}_{${label}}`;
+    // Clean up label but keep it recognizable
+    let labelText = n.label && n.label !== n.id ? n.label : n.id;
+    // Just remove braces to avoid LaTeX errors, keep other chars
+    labelText = `${labelText}`.replace(/[{}]/g, ''); 
+    
+    if (rows[pos.row - 1] && rows[pos.row - 1][pos.col - 1] !== undefined) {
+      rows[pos.row - 1][pos.col - 1] = `${symbol}_{${labelText}}`;
+    }
   });
 
   const lines = rows.map((row) => row.map((cell) => (cell === '' ? '{}' : cell)).join(' & '));
   const arrows = [];
 
-  initial.forEach((id) => {
-    const pos = positions.get(id);
+  // Initial arrows
+  // We iterate through all nodes to find which one matches the initial ID
+  // This handles potential subtle string mismatches (trimming, etc.)
+  const initialList = Array.from(initial);
+  
+  initialList.forEach((initId) => {
+    // Try exact match first
+    let pos = positions.get(initId);
+    
+    // If not found, try to find a node that looks very similar (ignore spaces/quotes)
+    if (!pos) {
+       const cleanInit = initId.replace(/["'\s]/g, '');
+       for (const [nodeId, nodePos] of positions.entries()) {
+          if (nodeId.replace(/["'\s]/g, '') === cleanInit) {
+             pos = nodePos;
+             break;
+          }
+       }
+    }
+
     if (!pos) return;
-    arrows.push(`\\arrow[from=1-1, to=${pos.row}-${pos.col}]`);
+
+    const srcRow = pos.row - 1;
+    const srcCol = pos.col - 1;
+    
+    arrows.push(`\\arrow[from=${srcRow}-${srcCol}, to=${pos.row}-${pos.col}]`);
   });
+
+  // --- CRITICAL FIX START ---
+  // Use a unique separator that won't appear in Regex IDs
+  const SEPARATOR = '___ARROW_SEP___'; 
 
   const edgeMap = new Map();
   edges.forEach((e) => {
-    const key = `${e.from}|${e.to}`;
+    const key = `${e.from}${SEPARATOR}${e.to}`;
     if (!edgeMap.has(key)) edgeMap.set(key, new Set());
     if (e.label) edgeMap.get(key).add(e.label);
   });
 
   edgeMap.forEach((labels, key) => {
-    const [fromId, toId] = key.split('|');
+    // Split using the safe separator
+    const parts = key.split(SEPARATOR);
+    // Handle edge case where split might fail (shouldn't happen with unique sep)
+    if (parts.length !== 2) return;
+    
+    const fromId = parts[0];
+    const toId = parts[1];
+
     const from = positions.get(fromId);
     const to = positions.get(toId);
+    
+    // Debug log if needed: console.log(`Edge: ${fromId} -> ${toId}`, from, to);
+    
     if (!from || !to) return;
+
     if (from.row === to.row && from.col === to.col) {
       const labelText = labels.size ? `, "${latexEscape(Array.from(labels).sort().join(', '))}"` : '';
-      arrows.push(`\\arrow[from=${from.row}-${from.col}, to=${to.row}-${to.col}, loop, out=45, in=315${labelText}]`);
+      arrows.push(`\\arrow[from=${from.row}-${from.col}, to=${to.row}-${to.col}, loop, out=120, in=60, distance=1.5em${labelText}]`);
       return;
     }
-    const reverseKey = `${toId}|${fromId}`;
+
+    const reverseKey = `${toId}${SEPARATOR}${fromId}`;
     const hasReverse = edgeMap.has(reverseKey);
     const bend = hasReverse ? (`${fromId}` < `${toId}` ? 'bend left=20' : 'bend right=20') : '';
     const labelText = labels.size ? `, "${latexEscape(Array.from(labels).sort().join(', '))}"` : '';
     const opt = bend ? `, ${bend}` : '';
+    
     arrows.push(`\\arrow[from=${from.row}-${from.col}, to=${to.row}-${to.col}${labelText}${opt}]`);
   });
+  // --- CRITICAL FIX END ---
 
   return [
     '\\begin{tikzcd}[row sep=2.5em, column sep=3em]',
