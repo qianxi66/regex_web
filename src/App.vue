@@ -74,14 +74,24 @@
             type="text"
           />
         </div>
-        <button
-          class="inline-flex items-center justify-center rounded-lg bg-teal-600 px-6 py-3 text-sm font-semibold uppercase tracking-wide text-white shadow-md transition hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-300 disabled:cursor-not-allowed disabled:bg-teal-300"
-          type="button"
-          :disabled="isRendering"
-          @click="handleConvert"
-        >
-          {{ isRendering ? 'Rendering...' : 'Convert' }}
-        </button>
+        <div class="flex flex-wrap items-center gap-2">
+          <button
+            class="inline-flex items-center justify-center rounded-lg bg-teal-600 px-6 py-3 text-sm font-semibold uppercase tracking-wide text-white shadow-md transition hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-teal-300 disabled:cursor-not-allowed disabled:bg-teal-300"
+            type="button"
+            :disabled="isRendering"
+            @click="handleConvert"
+          >
+            {{ isRendering ? 'Rendering...' : 'Convert' }}
+          </button>
+          <button
+            class="inline-flex items-center justify-center rounded-lg bg-slate-900 px-6 py-3 text-sm font-semibold uppercase tracking-wide text-white shadow-md transition hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-300"
+            type="button"
+            :disabled="isQuiverGenerating"
+            @click="generateQuiverForActive"
+          >
+            {{ isQuiverGenerating ? 'Generating...' : 'Generate Quiver' }}
+          </button>
+        </div>
       </div>
 
       <div class="mt-6 rounded-lg bg-white p-5 shadow">
@@ -124,6 +134,34 @@
               </div>
             </div>
           </div>
+        </div>
+        <div v-if="quiverOutput" class="mt-4 rounded-lg border border-gray-200 bg-gray-50 p-4">
+          <div class="flex items-center justify-between gap-3">
+            <p class="text-xs font-semibold text-gray-600">Quiver LaTeX</p>
+            <div class="relative">
+              <button
+                class="rounded-full bg-gray-900 px-3 py-1 text-xs font-semibold text-white transition hover:bg-gray-800"
+                type="button"
+                @click="copyQuiver"
+              >
+                Copy
+              </button>
+              <div
+                v-if="copyStatus"
+                class="absolute right-0 top-[-32px] rounded-md bg-gray-100 px-2 py-1 text-[10px] font-semibold text-gray-700 shadow border border-gray-200"
+              >
+                {{ copyStatus }}
+                <span
+                  class="absolute -bottom-1 right-2 h-2 w-2 rotate-45 bg-gray-100 border-r border-b border-gray-200"
+                ></span>
+              </div>
+            </div>
+          </div>
+          <textarea
+            class="mt-2 h-40 w-full rounded-md border border-gray-200 bg-white p-3 text-xs text-gray-700"
+            readonly
+            :value="quiverOutput"
+          ></textarea>
         </div>
       </div>
 
@@ -564,6 +602,9 @@ const parsedCache = ref({ expr: '', data: null });
 const renderSeq = ref(0);
 const vizWorker = ref(null);
 const workerSeq = ref(0);
+const quiverOutput = ref('');
+const copyStatus = ref('');
+const isQuiverGenerating = ref(false);
 const MAX_AUTOMATON_STATES = 400;
 const MAX_AUTOMATON_EDGES = 2000;
 
@@ -1164,6 +1205,320 @@ const parseExpression = (expr) => {
   const trimmed = expr.trim() || 'ε';
   const data = baseBuild(trimmed);
   return { expr: trimmed, data };
+};
+
+const parseDotToGraph = (dot) => {
+  const nodes = new Map();
+  const edges = [];
+  const initial = new Set();
+  const lines = dot.split('\n');
+
+  const edgeRegex = /^\s*("?)(.+?)\1\s*->\s*("?)(.+?)\3(?:\s*\[([^\]]*)\])?/;
+  const nodeRegex = /^\s*("?)(.+?)\1\s*\[([^\]]*)\]/;
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('digraph') || trimmed.startsWith('rankdir')) return;
+    const edgeMatch = trimmed.match(edgeRegex);
+    if (edgeMatch) {
+      const from = edgeMatch[2].trim();
+      const to = edgeMatch[4].trim();
+      const attrs = edgeMatch[5] || '';
+      const labelMatch = attrs.match(/label="([^"]*)"/);
+      const label = labelMatch ? labelMatch[1] : '';
+      if (from === 'start') {
+        initial.add(to);
+      } else {
+        edges.push({ from, to, label });
+      }
+      return;
+    }
+    const nodeMatch = trimmed.match(nodeRegex);
+    if (nodeMatch) {
+      const id = nodeMatch[2].trim();
+      const attrs = nodeMatch[3] || '';
+      const labelMatch = attrs.match(/label="([^"]*)"/);
+      const label = labelMatch ? labelMatch[1] : id;
+      const accept = /peripheries\s*=\s*2/.test(attrs);
+      nodes.set(id, { id, label, accept });
+    }
+  });
+
+  edges.forEach((e) => {
+    if (!nodes.has(e.from)) nodes.set(e.from, { id: e.from, label: e.from, accept: false });
+    if (!nodes.has(e.to)) nodes.set(e.to, { id: e.to, label: e.to, accept: false });
+  });
+
+  if (!initial.size && nodes.size) {
+    initial.add(nodes.keys().next().value);
+  }
+
+  return { nodes, edges, initial };
+};
+
+const latexEscape = (text) =>
+  text
+    .replace(/\\/g, '\\textbackslash ')
+    .replace(/([#$%&_{}])/g, '\\$1')
+    .replace(/~/g, '\\textasciitilde ')
+    .replace(/\^/g, '\\textasciicircum ');
+
+const normalizeId = (id) => {
+  let out = `${id}`.replace(/[^a-zA-Z0-9]+/g, '_');
+  if (!out) out = 'q';
+  if (/^[0-9]/.test(out)) out = `q${out}`;
+  return out;
+};
+
+const median = (values) => {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+const buildLayoutFromSvg = (positions) => {
+  const items = Array.from(positions.entries()).map(([id, pos]) => ({ id, ...pos }));
+  if (items.length === 0) return null;
+  const xs = items.map((p) => p.x).sort((a, b) => a - b);
+  const ys = items.map((p) => p.y).sort((a, b) => a - b);
+  const xDiffs = xs.slice(1).map((v, i) => v - xs[i]);
+  const yDiffs = ys.slice(1).map((v, i) => v - ys[i]);
+  const xStep = Math.max(median(xDiffs) * 0.6, 20);
+  const yStep = Math.max(median(yDiffs) * 0.6, 20);
+
+  const xGroups = [];
+  xs.forEach((x) => {
+    if (!xGroups.length || x - xGroups[xGroups.length - 1] > xStep) {
+      xGroups.push(x);
+    }
+  });
+  const yGroups = [];
+  ys.forEach((y) => {
+    if (!yGroups.length || y - yGroups[yGroups.length - 1] > yStep) {
+      yGroups.push(y);
+    }
+  });
+
+  const positionsMap = new Map();
+  const occupied = new Set();
+  let maxRow = yGroups.length + 1;
+
+  items
+    .sort((a, b) => (a.x - b.x) || (a.y - b.y))
+    .forEach((item) => {
+      const colIndex = xGroups.findIndex((x) => Math.abs(item.x - x) <= xStep);
+      const rowIndex = yGroups.findIndex((y) => Math.abs(item.y - y) <= yStep);
+      let row = Math.max(1, rowIndex + 1);
+      const col = Math.max(1, colIndex + 1);
+      let key = `${row}-${col}`;
+      while (occupied.has(key)) {
+        row += 1;
+        key = `${row}-${col}`;
+      }
+      occupied.add(key);
+      maxRow = Math.max(maxRow, row);
+      positionsMap.set(item.id, { row: row + 1, col: col + 1 });
+    });
+
+  return { positions: positionsMap, rows: maxRow + 1, cols: xGroups.length + 1 };
+};
+
+const extractPositionsFromSvg = (svgText) => {
+  const positions = new Map();
+  if (!svgText) return positions;
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(svgText, 'image/svg+xml');
+  const nodeGroups = doc.querySelectorAll('g.node');
+  nodeGroups.forEach((node) => {
+    const title = node.querySelector('title');
+    const id = title ? title.textContent.trim() : '';
+    if (!id) return;
+    const ellipse = node.querySelector('ellipse');
+    const circle = node.querySelector('circle');
+    const polygon = node.querySelector('polygon');
+    if (ellipse) {
+      const cx = parseFloat(ellipse.getAttribute('cx') || '0');
+      const cy = parseFloat(ellipse.getAttribute('cy') || '0');
+      positions.set(id, { x: cx, y: cy });
+      return;
+    }
+    if (circle) {
+      const cx = parseFloat(circle.getAttribute('cx') || '0');
+      const cy = parseFloat(circle.getAttribute('cy') || '0');
+      positions.set(id, { x: cx, y: cy });
+      return;
+    }
+    if (polygon) {
+      const points = polygon.getAttribute('points') || '';
+      const coords = points
+        .trim()
+        .split(/\s+/)
+        .map((pair) => pair.split(',').map((v) => parseFloat(v)));
+      if (!coords.length) return;
+      const sum = coords.reduce(
+        (acc, [x, y]) => ({ x: acc.x + x, y: acc.y + y }),
+        { x: 0, y: 0 },
+      );
+      positions.set(id, { x: sum.x / coords.length, y: sum.y / coords.length });
+    }
+  });
+  return positions;
+};
+
+const buildFallbackLayout = ({ nodes, edges, initial }) => {
+  const adjacency = new Map();
+  nodes.forEach((n) => adjacency.set(n.id, []));
+  edges.forEach((e) => {
+    if (!adjacency.has(e.from)) adjacency.set(e.from, []);
+    adjacency.get(e.from).push(e.to);
+  });
+
+  const level = new Map();
+  const queue = [];
+  initial.forEach((id) => {
+    level.set(id, 0);
+    queue.push(id);
+  });
+  while (queue.length) {
+    const cur = queue.shift();
+    const nexts = adjacency.get(cur) || [];
+    nexts.forEach((nxt) => {
+      if (!level.has(nxt)) {
+        level.set(nxt, (level.get(cur) || 0) + 1);
+        queue.push(nxt);
+      }
+    });
+  }
+
+  let maxLevel = 0;
+  nodes.forEach((n) => {
+    if (level.has(n.id)) {
+      maxLevel = Math.max(maxLevel, level.get(n.id));
+    }
+  });
+  nodes.forEach((n) => {
+    if (!level.has(n.id)) {
+      level.set(n.id, maxLevel + 1);
+    }
+    maxLevel = Math.max(maxLevel, level.get(n.id));
+  });
+
+  const buckets = new Map();
+  nodes.forEach((n) => {
+    const lv = level.get(n.id) || 0;
+    if (!buckets.has(lv)) buckets.set(lv, []);
+    buckets.get(lv).push(n);
+  });
+  buckets.forEach((arr) => arr.sort((a, b) => `${a.id}`.localeCompare(`${b.id}`)));
+
+  const maxRows = Math.max(...Array.from(buckets.values()).map((arr) => arr.length), 1);
+  const positionsMap = new Map();
+  buckets.forEach((arr, lv) => {
+    arr.forEach((n, idx) => {
+      positionsMap.set(n.id, { row: idx + 2, col: lv + 2 });
+    });
+  });
+
+  return { positions: positionsMap, rows: maxRows + 2, cols: maxLevel + 2 };
+};
+
+const buildTikzcd = ({ nodes, edges, initial }, layout) => {
+  const layoutData = layout || buildFallbackLayout({ nodes, edges, initial });
+  const positions = layoutData.positions;
+  const totalRows = layoutData.rows;
+  const totalCols = layoutData.cols;
+
+  const rows = Array.from({ length: totalRows }, () => Array.from({ length: totalCols }, () => ''));
+  rows[0][0] = '{}';
+
+  nodes.forEach((n) => {
+    const pos = positions.get(n.id);
+    if (!pos) return;
+    const symbol = n.accept ? '\\bullet' : '\\circ';
+    const label = `\\mathrm{${normalizeId(n.id)}}`;
+    rows[pos.row - 1][pos.col - 1] = `${symbol}_{${label}}`;
+  });
+
+  const lines = rows.map((row) => row.map((cell) => (cell === '' ? '{}' : cell)).join(' & '));
+  const arrows = [];
+
+  initial.forEach((id) => {
+    const pos = positions.get(id);
+    if (!pos) return;
+    arrows.push(`\\arrow[from=1-1, to=${pos.row}-${pos.col}]`);
+  });
+
+  const edgeMap = new Map();
+  edges.forEach((e) => {
+    const key = `${e.from}|${e.to}`;
+    if (!edgeMap.has(key)) edgeMap.set(key, new Set());
+    if (e.label) edgeMap.get(key).add(e.label);
+  });
+
+  edgeMap.forEach((labels, key) => {
+    const [fromId, toId] = key.split('|');
+    const from = positions.get(fromId);
+    const to = positions.get(toId);
+    if (!from || !to) return;
+    if (from.row === to.row && from.col === to.col) {
+      const labelText = labels.size ? `, "${latexEscape(Array.from(labels).sort().join(', '))}"` : '';
+      arrows.push(`\\arrow[from=${from.row}-${from.col}, to=${to.row}-${to.col}, loop, out=45, in=315${labelText}]`);
+      return;
+    }
+    const reverseKey = `${toId}|${fromId}`;
+    const hasReverse = edgeMap.has(reverseKey);
+    const bend = hasReverse ? (`${fromId}` < `${toId}` ? 'bend left=20' : 'bend right=20') : '';
+    const labelText = labels.size ? `, "${latexEscape(Array.from(labels).sort().join(', '))}"` : '';
+    const opt = bend ? `, ${bend}` : '';
+    arrows.push(`\\arrow[from=${from.row}-${from.col}, to=${to.row}-${to.col}${labelText}${opt}]`);
+  });
+
+  return [
+    '\\begin{tikzcd}[row sep=2.5em, column sep=3em]',
+    ...lines.map((line) => `  ${line} \\\\`),
+    ...arrows.map((a) => `  ${a}`),
+    '\\end{tikzcd}',
+  ].join('\n');
+};
+
+const generateQuiverForActive = async () => {
+  if (isQuiverGenerating.value) return;
+  isQuiverGenerating.value = true;
+  const expr = regexInput.value.trim() || 'ε';
+  if (parsedCache.value.expr !== expr) {
+    parsedCache.value = parseExpression(expr);
+    dotByType.value = {};
+    svgByType.value = {};
+  }
+  const { data } = parsedCache.value;
+  const tab = activeTab.value;
+  if (!dotByType.value[tab]) {
+    dotByType.value[tab] = getDotForTab(tab, expr, data);
+  }
+  try {
+    if (!svgByType.value[tab]) {
+      svgByType.value[tab] = await renderDotWithWorker(dotByType.value[tab]);
+    }
+    const graph = parseDotToGraph(dotByType.value[tab]);
+    const layout = buildLayoutFromSvg(extractPositionsFromSvg(svgByType.value[tab]));
+    quiverOutput.value = buildTikzcd(graph, layout);
+  } finally {
+    isQuiverGenerating.value = false;
+  }
+};
+
+const copyQuiver = async () => {
+  if (!quiverOutput.value) return;
+  try {
+    await navigator.clipboard.writeText(quiverOutput.value);
+    copyStatus.value = 'Copied';
+    setTimeout(() => {
+      copyStatus.value = '';
+    }, 1200);
+  } catch (err) {
+    console.error(err);
+  }
 };
 
 const ensureVizWorker = () => {
