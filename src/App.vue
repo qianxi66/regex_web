@@ -95,10 +95,33 @@
       </div>
 
       <div class="mt-6 rounded-lg bg-white p-5 shadow">
+        <div class="mb-2">
+          <p class="text-sm font-semibold text-gray-700">Preprocess: SSF / SNF</p>
+          <p class="text-xs text-gray-500 mt-0.5">Rewrite current input and write result back. SSF = strict star form; SNF = star normal form.</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <button
+            class="rounded-lg border border-amber-600 bg-amber-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-600"
+            type="button"
+            @click="applySSFToInput"
+          >
+            SSF
+          </button>
+          <button
+            class="rounded-lg border border-teal-600 bg-teal-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-teal-600"
+            type="button"
+            @click="applySNFToInput"
+          >
+            SNF
+          </button>
+        </div>
+      </div>
+
+      <div class="mt-6 rounded-lg bg-white p-5 shadow">
         <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p class="text-sm font-semibold text-gray-700">Visualization</p>
-            <p class="text-xs text-gray-500">Switch among 9 constructions from the paper</p>
+            <p class="text-xs text-gray-500">Switch among 9 constructions from the paper. A_POS uses SNF internally.</p>
           </div>
           <div class="flex flex-wrap gap-2">
             <button
@@ -199,7 +222,7 @@
 import { computed, onMounted, ref } from 'vue';
 
 const regexInput = ref('(a+b)*a');
-const examples = ['(a+b)*a', '(b+ab)*+b*', 'a*b*a*', '(a+b)c*', '(a+b)*'];
+const examples = ['(a+b)*a', '(a*b)*', '(b+ab)*+b*', 'a*b*a*', '(a+b)c*', '(a+b)*'];
 const vizContainer = ref(null);
 const isRendering = ref(false);
 const errorMessage = ref('');
@@ -526,14 +549,18 @@ const baseBuild = (regex) => {
   const tokens = tokenize(regex);
   const postfix = toPostfix(tokens);
   const astRaw = buildAst(postfix);
-  const { node: ast, posMap } = markPositions(astRaw);
+  const astReduced = reduceRegexByAxioms(astRaw);
+  const astSSF = toSSF(astReduced);
+  const astSNF = toSNF(astSSF);
+  const astFinal = reduceRegexByAxioms(astSNF);
+  const { node: ast, posMap } = markPositions(astFinal);
   const pos = buildPositionAutomaton(ast);
   const nfaData = nullableFirstLast(ast);
   const alphabet = Array.from(new Set(Object.values(posMap)));
   return { ast, posMap, pos, nfaData, alphabet, tokens, postfix };
 };
 
-const buildPosDot = (regex, pos, posMap) => {
+const buildPosDot = (regex, pos, posMap, title = 'A_POS') => {
   const edges = [];
   (pos.follow.get(0) || []).forEach((j) => {
     edges.push(`  0 -> ${j} [label="${posMap[j]}"];`);
@@ -555,7 +582,7 @@ const buildPosDot = (regex, pos, posMap) => {
 digraph {
   rankdir=LR;
   labelloc="t";
-  label="A_POS for: ${label.replace(/"/g, '\\"')}";
+  label="${title} for: ${label.replace(/"/g, '\\"')}";
   fontsize=14;
   node [shape=circle, style=filled, fillcolor="#e0f2f1", color="#009688", fontcolor="#004d40"];
   edge [color="#00695c", penwidth=2, arrowsize=0.8];
@@ -904,6 +931,66 @@ const cloneAst = (node) => {
   return { ...node };
 };
 
+/** Nullable from structure only (no positions). Used by SNF. */
+const nullableStructure = (node) => {
+  if (!node) return false;
+  if (node.kind === 'sym' || node.kind === 'empty') return false;
+  if (node.kind === 'eps') return true;
+  if (node.kind === 'union') return nullableStructure(node.left) || nullableStructure(node.right);
+  if (node.kind === 'concat') return nullableStructure(node.left) && nullableStructure(node.right);
+  if (node.kind === 'star') return true;
+  return false;
+};
+
+/** E-circ: remove feedback for star (Definition 3.4). Used inside toSNF. */
+const removeFeedback = (node) => {
+  if (!node) return { kind: 'empty' };
+  if (node.kind === 'sym' || node.kind === 'eps' || node.kind === 'empty') return cloneAst(node);
+  if (node.kind === 'union') {
+    const F = node.left;
+    const G = node.right;
+    const nF = nullableStructure(F);
+    const nG = nullableStructure(G);
+    if (nF && !nG) return { kind: 'union', left: removeFeedback(F), right: cloneAst(G) };
+    if (!nF && nG) return { kind: 'union', left: cloneAst(F), right: removeFeedback(G) };
+    return { kind: 'union', left: removeFeedback(F), right: removeFeedback(G) };
+  }
+  if (node.kind === 'concat') {
+    const F = node.left;
+    const G = node.right;
+    const nF = nullableStructure(F);
+    const nG = nullableStructure(G);
+    if (nF && !nG) return { kind: 'concat', left: removeFeedback(F), right: cloneAst(G) };
+    if (!nF && nG) return { kind: 'concat', left: cloneAst(F), right: removeFeedback(G) };
+    if (nF && nG) {
+      const leftPart = { kind: 'concat', left: removeFeedback(F), right: cloneAst(G) };
+      const rightPart = removeFeedback(G);
+      return { kind: 'union', left: leftPart, right: rightPart };
+    }
+    return { kind: 'concat', left: cloneAst(F), right: removeFeedback(G) };
+  }
+  if (node.kind === 'star') return removeFeedback(node.child);
+  return { kind: 'empty' };
+};
+
+/** E-dot: Star Normal Form (Definition 3.2). Returns new AST. */
+const toSNF = (node) => {
+  if (!node) return { kind: 'empty' };
+  if (node.kind === 'sym' || node.kind === 'eps' || node.kind === 'empty') return cloneAst(node);
+  if (node.kind === 'union') {
+    return { kind: 'union', left: toSNF(node.left), right: toSNF(node.right) };
+  }
+  if (node.kind === 'concat') {
+    return { kind: 'concat', left: toSNF(node.left), right: toSNF(node.right) };
+  }
+  if (node.kind === 'star') {
+    const Fsnf = toSNF(node.child);
+    const Fbody = removeFeedback(Fsnf);
+    return { kind: 'star', child: Fbody };
+  }
+  return { kind: 'empty' };
+};
+
 const collectUnionTerms = (node, terms = []) => {
   if (node.kind === 'union') {
     collectUnionTerms(node.left, terms);
@@ -924,56 +1011,230 @@ const buildBalancedUnion = (terms) => {
   return { kind: 'union', left, right };
 };
 
-const normalizeAST = (node) => {
-  if (!node) return { kind: 'empty' };
-
+const collectConcatTerms = (node, terms = []) => {
   if (node.kind === 'concat') {
-    const left = normalizeAST(node.left);
-    const right = normalizeAST(node.right);
-    
-    if (left.kind === 'empty' || right.kind === 'empty') return { kind: 'empty' };
-    
-    if (left.kind === 'eps') return right;
-    if (right.kind === 'eps') return left;
-
-    return { kind: 'concat', left, right };
+    collectConcatTerms(node.left, terms);
+    collectConcatTerms(node.right, terms);
+  } else {
+    terms.push(node);
   }
+  return terms;
+};
+
+const buildConcatFromTerms = (terms) => {
+  if (terms.length === 0) return { kind: 'eps' };
+  if (terms.length === 1) return terms[0];
+  return terms.reduce((acc, cur) => ({ kind: 'concat', left: acc, right: cur }));
+};
+
+const normalizeUnionTerms = (terms) => {
+  const flat = [];
+  terms.forEach((t) => {
+    if (!t) return;
+    if (t.kind === 'union') {
+      collectUnionTerms(t, flat);
+    } else {
+      flat.push(t);
+    }
+  });
+  const cleaned = flat.filter((t) => t.kind !== 'empty');
+  if (cleaned.length === 0) return { kind: 'empty' };
+  const unique = new Map();
+  cleaned.forEach((t) => {
+    const key = astToString(t);
+    if (!unique.has(key)) unique.set(key, t);
+  });
+  const keys = Array.from(unique.keys()).sort();
+  if (keys.length === 1) return unique.get(keys[0]);
+  return buildBalancedUnion(keys.map((k) => unique.get(k)));
+};
+
+/**
+ * Full algebraic reduction (ACI + Z + Monoid + SR):
+ * - ACI/ACIZ on union
+ * - monoid unit/associativity on concatenation
+ * - semiring zero absorption and distributivity
+ */
+const reduceRegexByAxioms = (node, ctx = { expansions: 0 }) => {
+  const MAX_DISTRIBUTION_EXPANSIONS = 2048;
+  if (!node) return { kind: 'empty' };
+  if (node.kind === 'sym' || node.kind === 'eps' || node.kind === 'empty') return cloneAst(node);
 
   if (node.kind === 'star') {
-    const child = normalizeAST(node.child);
-    // 优化：0* = eps, eps* = eps
+    const child = reduceRegexByAxioms(node.child, ctx);
     if (child.kind === 'empty' || child.kind === 'eps') return { kind: 'eps' };
-    // 优化：(R*)* = R*
-    if (child.kind === 'star') return child; 
-    
+    if (child.kind === 'star') return child;
     return { kind: 'star', child };
   }
 
   if (node.kind === 'union') {
-    let terms = collectUnionTerms(node);
-    
-    terms = terms.map(normalizeAST);
-    terms = terms.filter(t => t.kind !== 'empty');
-
-    if (terms.length === 0) return { kind: 'empty' };
-
-    const uniqueMap = new Map();
-    terms.forEach(t => {
-      const s = astToString(t); 
-      if (!uniqueMap.has(s)) {
-        uniqueMap.set(s, t);
-      }
-    });
-    const sortedKeys = Array.from(uniqueMap.keys()).sort();
-    
-    if (sortedKeys.length === 1) return uniqueMap.get(sortedKeys[0]);
-
-    const sortedTerms = sortedKeys.map(k => uniqueMap.get(k));
-    return buildBalancedUnion(sortedTerms);
+    const terms = collectUnionTerms(node).map((t) => reduceRegexByAxioms(t, ctx));
+    return normalizeUnionTerms(terms);
   }
 
-  return node; // sym, eps, empty
+  if (node.kind === 'concat') {
+    const terms = collectConcatTerms(node)
+      .map((t) => reduceRegexByAxioms(t, ctx))
+      .filter((t) => t.kind !== 'eps');
+    if (terms.some((t) => t.kind === 'empty')) return { kind: 'empty' };
+    if (terms.length === 0) return { kind: 'eps' };
+
+    let products = [[]];
+    let distributionCapped = false;
+    terms.forEach((term) => {
+      if (term.kind === 'union' && !distributionCapped) {
+        const choices = collectUnionTerms(term);
+        const projected = products.length * choices.length;
+        if (ctx.expansions + projected > MAX_DISTRIBUTION_EXPANSIONS) {
+          distributionCapped = true;
+          products.forEach((p) => p.push(term));
+          return;
+        }
+        ctx.expansions += projected;
+        const next = [];
+        products.forEach((base) => {
+          choices.forEach((choice) => {
+            next.push([...base, choice]);
+          });
+        });
+        products = next;
+      } else {
+        products.forEach((p) => p.push(term));
+      }
+    });
+
+    const productTerms = products.map((factors) => buildConcatFromTerms(factors));
+    return productTerms.length === 1 ? productTerms[0] : normalizeUnionTerms(productTerms);
+  }
+
+  return cloneAst(node);
 };
+
+/**
+ * SSF rewrite system: each rule applies once at one redex (leftmost).
+ * Rule 1: (x+1)* = x*   -- remove eps from star body union
+ * Rule 2: (x+y*)* = (x+y)*  -- replace star term by its body in star body union
+ * Rule 3: (x·y)* = (x+y)* when x,y nullable  -- concat to union in star body
+ */
+
+const applySSFRule1 = (node) => {
+  if (!node) return { changed: false, ast: { kind: 'empty' } };
+  if (node.kind === 'star' && node.child.kind === 'union') {
+    const terms = collectUnionTerms(node.child);
+    if (terms.some((t) => t.kind === 'eps')) {
+      const rest = terms.filter((t) => t.kind !== 'eps');
+      const newBody = rest.length ? normalizeUnionTerms(rest) : { kind: 'eps' };
+      return { changed: true, ast: { kind: 'star', child: newBody } };
+    }
+  }
+  if (node.kind === 'union') {
+    const L = applySSFRule1(node.left);
+    if (L.changed) return { changed: true, ast: { kind: 'union', left: L.ast, right: cloneAst(node.right) } };
+    const R = applySSFRule1(node.right);
+    if (R.changed) return { changed: true, ast: { kind: 'union', left: cloneAst(node.left), right: R.ast } };
+  }
+  if (node.kind === 'concat') {
+    const L = applySSFRule1(node.left);
+    if (L.changed) return { changed: true, ast: { kind: 'concat', left: L.ast, right: cloneAst(node.right) } };
+    const R = applySSFRule1(node.right);
+    if (R.changed) return { changed: true, ast: { kind: 'concat', left: cloneAst(node.left), right: R.ast } };
+  }
+  if (node.kind === 'star') {
+    const C = applySSFRule1(node.child);
+    if (C.changed) return { changed: true, ast: { kind: 'star', child: C.ast } };
+  }
+  return { changed: false, ast: cloneAst(node) };
+};
+
+const applySSFRule2 = (node) => {
+  if (!node) return { changed: false, ast: { kind: 'empty' } };
+  if (node.kind === 'star' && node.child.kind === 'union') {
+    const terms = collectUnionTerms(node.child);
+    if (terms.some((t) => t.kind === 'star')) {
+      const newTerms = terms.map((t) => (t.kind === 'star' ? cloneAst(t.child) : cloneAst(t)));
+      const newBody = normalizeUnionTerms(newTerms);
+      return { changed: true, ast: { kind: 'star', child: newBody } };
+    }
+  }
+  if (node.kind === 'union') {
+    const L = applySSFRule2(node.left);
+    if (L.changed) return { changed: true, ast: { kind: 'union', left: L.ast, right: cloneAst(node.right) } };
+    const R = applySSFRule2(node.right);
+    if (R.changed) return { changed: true, ast: { kind: 'union', left: cloneAst(node.left), right: R.ast } };
+  }
+  if (node.kind === 'concat') {
+    const L = applySSFRule2(node.left);
+    if (L.changed) return { changed: true, ast: { kind: 'concat', left: L.ast, right: cloneAst(node.right) } };
+    const R = applySSFRule2(node.right);
+    if (R.changed) return { changed: true, ast: { kind: 'concat', left: cloneAst(node.left), right: R.ast } };
+  }
+  if (node.kind === 'star') {
+    const C = applySSFRule2(node.child);
+    if (C.changed) return { changed: true, ast: { kind: 'star', child: C.ast } };
+  }
+  return { changed: false, ast: cloneAst(node) };
+};
+
+const applySSFRule3 = (node) => {
+  if (!node) return { changed: false, ast: { kind: 'empty' } };
+  if (node.kind === 'star' && node.child.kind === 'concat') {
+    const factors = collectConcatTerms(node.child);
+    if (factors.length >= 2 && factors.every((f) => nullableStructure(f))) {
+      const newBody = normalizeUnionTerms(factors.map((f) => cloneAst(f)));
+      return { changed: true, ast: { kind: 'star', child: newBody } };
+    }
+  }
+  if (node.kind === 'union') {
+    const L = applySSFRule3(node.left);
+    if (L.changed) return { changed: true, ast: { kind: 'union', left: L.ast, right: cloneAst(node.right) } };
+    const R = applySSFRule3(node.right);
+    if (R.changed) return { changed: true, ast: { kind: 'union', left: cloneAst(node.left), right: R.ast } };
+  }
+  if (node.kind === 'concat') {
+    const L = applySSFRule3(node.left);
+    if (L.changed) return { changed: true, ast: { kind: 'concat', left: L.ast, right: cloneAst(node.right) } };
+    const R = applySSFRule3(node.right);
+    if (R.changed) return { changed: true, ast: { kind: 'concat', left: cloneAst(node.left), right: R.ast } };
+  }
+  if (node.kind === 'star') {
+    const C = applySSFRule3(node.child);
+    if (C.changed) return { changed: true, ast: { kind: 'star', child: C.ast } };
+  }
+  return { changed: false, ast: cloneAst(node) };
+};
+
+const applySSFRuleToFixpoint = (node, rule, maxRounds = 50) => {
+  let cur = cloneAst(node);
+  for (let r = 0; r < maxRounds; r += 1) {
+    const out = rule(cur);
+    if (!out.changed) return cur;
+    cur = reduceRegexByAxioms(out.ast);
+  }
+  return cur;
+};
+
+/** SSF normal form: apply rules in fixed order to fixpoint (terminating, unique). */
+const toSSF = (node) => {
+  if (!node) return { kind: 'empty' };
+  if (node.kind === 'sym' || node.kind === 'eps' || node.kind === 'empty') return cloneAst(node);
+  if (node.kind === 'union') {
+    return normalizeUnionTerms([toSSF(node.left), toSSF(node.right)]);
+  }
+  if (node.kind === 'concat') {
+    return buildConcatFromTerms(collectConcatTerms(node).map((t) => toSSF(t)));
+  }
+  if (node.kind === 'star') {
+    let body = reduceRegexByAxioms(toSSF(node.child));
+    body = applySSFRuleToFixpoint(body, applySSFRule1);
+    body = applySSFRuleToFixpoint(body, applySSFRule2);
+    body = applySSFRuleToFixpoint(body, applySSFRule3);
+    return reduceRegexByAxioms({ kind: 'star', child: body });
+  }
+  return { kind: 'empty' };
+};
+
+/** Backward-compatible alias used by existing call sites. */
+const aciReduce = (node) => reduceRegexByAxioms(node);
 
 const brz = (node, sym) => {
   if (!node) return { kind: 'empty' };
@@ -1000,7 +1261,7 @@ const brz = (node, sym) => {
 };
 
 const buildBrzDot = (regex, ast, alphabet) => {
-  const start = normalizeAST(ast);
+  const start = ast;
   
   const queue = [start];
   const startKey = astToString(start);
@@ -1016,12 +1277,8 @@ const buildBrzDot = (regex, ast, alphabet) => {
     const curKey = astToString(cur);
 
     alphabet.forEach((sym) => {
-      // 1. 计算导数
       let next = brz(cur, sym);
-      
-      // 2. *** 关键修改：立即规范化 ***
-      // 这会把 (a|b)|c 变成 a|b|c，把 b|a 变成 a|b
-      next = normalizeAST(next);
+      next = reduceRegexByAxioms(next);
       
       const nk = astToString(next);
       
@@ -1310,6 +1567,36 @@ const getDotForTab = (tab, expr, data) => {
   }
 };
 
+const getReducedAstFromInput = () => {
+  const expr = regexInput.value.trim() || 'ε';
+  const tokens = tokenize(expr);
+  const postfix = toPostfix(tokens);
+  const astRaw = buildAst(postfix);
+  return reduceRegexByAxioms(astRaw);
+};
+
+const applySSFToInput = () => {
+  errorMessage.value = '';
+  try {
+    const ast = getReducedAstFromInput();
+    const out = toSSF(ast);
+    regexInput.value = astToString(reduceRegexByAxioms(out));
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : 'Parse error';
+  }
+};
+
+const applySNFToInput = () => {
+  errorMessage.value = '';
+  try {
+    const ast = getReducedAstFromInput();
+    const out = toSNF(ast);
+    regexInput.value = astToString(reduceRegexByAxioms(out));
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : 'Parse error';
+  }
+};
+
 const parseExpression = (expr) => {
   const trimmed = expr.trim() || 'ε';
   const data = baseBuild(trimmed);
@@ -1394,6 +1681,24 @@ const latexEscape = (text) =>
     .replace(/([#$%&_{}])/g, '\\$1')
     .replace(/~/g, '\\textasciitilde ')
     .replace(/\^/g, '\\textasciicircum ');
+
+/** Format node label for Quiver: set {1,3} -> a_{1,3}, accepting state -> underline. */
+const formatQuiverNodeLabel = (label, accept) => {
+  const raw = (label || '').trim();
+  const setMatch = raw.match(/^\s*\{([^}]*)\}(?:\s*,\s*ε)?\s*$/);
+  let subscript;
+  if (setMatch) {
+    subscript = setMatch[1].replace(/\s/g, '').replace(/,+/g, ',');
+  } else if (/^\d+$/.test(raw)) {
+    subscript = raw;
+  } else {
+    const cleaned = raw.replace(/[{}]/g, '').replace(/\s+/g, ' ').trim() || '0';
+    subscript = latexEscape(cleaned);
+  }
+  let cell = `a_{${subscript}}`;
+  if (accept) cell = `\\underline{${cell}}`;
+  return cell;
+};
 
 const normalizeId = (id) => {
   let out = `${id}`.replace(/[^a-zA-Z0-9]+/g, '_');
@@ -1570,19 +1875,16 @@ const buildTikzcd = ({ nodes, edges, initial }, layout) => {
   // Initialize grid
   const rows = Array.from({ length: totalRows }, () => Array.from({ length: totalCols }, () => ''));
 
-  // Fill nodes
+  // Fill nodes: set labels as a_{subscript}, accepting states with underline
   nodes.forEach((n) => {
     const pos = positions.get(n.id);
     if (!pos) return;
 
-    const symbol = n.accept ? '\\bullet' : '\\circ';
-    // Clean up label but keep it recognizable
-    let labelText = n.label && n.label !== n.id ? n.label : n.id;
-    // Just remove braces to avoid LaTeX errors, keep other chars
-    labelText = `${labelText}`.replace(/[{}]/g, ''); 
-    
+    const label = n.label != null && n.label !== n.id ? n.label : n.id;
+    const cellContent = formatQuiverNodeLabel(label, n.accept);
+
     if (rows[pos.row - 1] && rows[pos.row - 1][pos.col - 1] !== undefined) {
-      rows[pos.row - 1][pos.col - 1] = `${symbol}_{${labelText}}`;
+      rows[pos.row - 1][pos.col - 1] = cellContent;
     }
   });
 
