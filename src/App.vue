@@ -549,10 +549,7 @@ const baseBuild = (regex) => {
   const tokens = tokenize(regex);
   const postfix = toPostfix(tokens);
   const astRaw = buildAst(postfix);
-  const astReduced = reduceRegexByAxioms(astRaw);
-  const astSSF = toSSF(astReduced);
-  const astSNF = toSNF(astSSF);
-  const astFinal = reduceRegexByAxioms(astSNF);
+  const astFinal = reduceRegexByAxioms(astRaw);
   const { node: ast, posMap } = markPositions(astFinal);
   const pos = buildPositionAutomaton(ast);
   const nfaData = nullableFirstLast(ast);
@@ -1053,28 +1050,33 @@ const normalizeUnionTerms = (terms) => {
  * Full algebraic reduction (ACI + Z + Monoid + SR):
  * - ACI/ACIZ on union
  * - monoid unit/associativity on concatenation
- * - semiring zero absorption and distributivity
+ * - semiring zero absorption
+ * - optional distributivity (disabled by default for automata positions stability)
  */
-const reduceRegexByAxioms = (node, ctx = { expansions: 0 }) => {
+const reduceRegexByAxioms = (
+  node,
+  ctx = { expansions: 0 },
+  options = { enableDistributivity: false },
+) => {
   const MAX_DISTRIBUTION_EXPANSIONS = 2048;
   if (!node) return { kind: 'empty' };
   if (node.kind === 'sym' || node.kind === 'eps' || node.kind === 'empty') return cloneAst(node);
 
   if (node.kind === 'star') {
-    const child = reduceRegexByAxioms(node.child, ctx);
+    const child = reduceRegexByAxioms(node.child, ctx, options);
     if (child.kind === 'empty' || child.kind === 'eps') return { kind: 'eps' };
     if (child.kind === 'star') return child;
     return { kind: 'star', child };
   }
 
   if (node.kind === 'union') {
-    const terms = collectUnionTerms(node).map((t) => reduceRegexByAxioms(t, ctx));
+    const terms = collectUnionTerms(node).map((t) => reduceRegexByAxioms(t, ctx, options));
     return normalizeUnionTerms(terms);
   }
 
   if (node.kind === 'concat') {
     const terms = collectConcatTerms(node)
-      .map((t) => reduceRegexByAxioms(t, ctx))
+      .map((t) => reduceRegexByAxioms(t, ctx, options))
       .filter((t) => t.kind !== 'eps');
     if (terms.some((t) => t.kind === 'empty')) return { kind: 'empty' };
     if (terms.length === 0) return { kind: 'eps' };
@@ -1082,7 +1084,7 @@ const reduceRegexByAxioms = (node, ctx = { expansions: 0 }) => {
     let products = [[]];
     let distributionCapped = false;
     terms.forEach((term) => {
-      if (term.kind === 'union' && !distributionCapped) {
+      if (options.enableDistributivity && term.kind === 'union' && !distributionCapped) {
         const choices = collectUnionTerms(term);
         const projected = products.length * choices.length;
         if (ctx.expansions + projected > MAX_DISTRIBUTION_EXPANSIONS) {
