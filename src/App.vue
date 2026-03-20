@@ -887,7 +887,7 @@ const pd = (node, sym) => {
 const pdKey = (nodes) => {
   const strs = nodes.map((n) => astToString(n));
   const uniq = Array.from(new Set(strs)).sort();
-  return uniq.join(' | ') || '∅';
+  return uniq.length ? `{${uniq.join(', ')}}` : '∅';
 };
 
 const buildPdDot = (regex, ast, alphabet) => {
