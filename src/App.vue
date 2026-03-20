@@ -545,6 +545,16 @@ const formatSetLabel = (stateKey) => {
   return `{${entries.join(',')}}${cPart === '1' ? ', ε' : ''}`;
 };
 
+const formatPositionWithSymbol = (pos, posMap) => {
+  const sym = posMap[pos] || '?';
+  return `${sym}_${pos}`;
+};
+
+const formatFollowSetLabel = (setRef, posMap) => {
+  const entries = Array.from(setRef || []).sort((a, b) => a - b);
+  return `{${entries.map((p) => formatPositionWithSymbol(p, posMap)).join(', ')}}`;
+};
+
 const baseBuild = (regex) => {
   const tokens = tokenize(regex);
   const postfix = toPostfix(tokens);
@@ -558,13 +568,20 @@ const baseBuild = (regex) => {
 };
 
 const buildPosDot = (regex, pos, posMap, title = 'A_POS') => {
+  const edgeSet = new Set();
   const edges = [];
+  const pushEdge = (from, to, label) => {
+    const key = `${from}->${to}|${label}`;
+    if (edgeSet.has(key)) return;
+    edgeSet.add(key);
+    edges.push(`  ${from} -> ${to} [label="${label}"];`);
+  };
   (pos.follow.get(0) || []).forEach((j) => {
-    edges.push(`  0 -> ${j} [label="${posMap[j]}"];`);
+    pushEdge(0, j, posMap[j]);
   });
   pos.follow.forEach((set, i) => {
     if (i === 0) return;
-    set.forEach((j) => edges.push(`  ${i} -> ${j} [label="${posMap[j]}"];`));
+    set.forEach((j) => pushEdge(i, j, posMap[j]));
   });
   const finals = Array.from(pos.finals).map((f) => `${f}`);
   const nodeDecl = pos.states
@@ -647,7 +664,8 @@ const buildFollowDot = (regex, pos, posMap, nfaData) => {
   const nodeLines = states
     .map((s) => {
       const per = s.isFinal ? ' peripheries=2' : '';
-      return `  "${s.key}" [label="{${Array.from(s.set).join(',')}}${s.isFinal ? ', ε' : ''}"${per}];`;
+      const label = `${formatFollowSetLabel(s.set, posMap)}${s.isFinal ? ', ε' : ''}`;
+      return `  "${s.key}" [label="${label}"${per}];`;
     })
     .join('\n');
   const edges = [];
