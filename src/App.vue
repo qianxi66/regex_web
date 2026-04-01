@@ -91,15 +91,36 @@
           >
             {{ isQuiverGenerating ? 'Generating...' : 'Generate Quiver' }}
           </button>
+          <button
+            class="inline-flex min-w-[13.5rem] shrink-0 items-center justify-center gap-2 rounded-lg border-2 border-indigo-600 bg-white px-5 py-3 text-sm font-semibold uppercase tracking-wide text-indigo-700 shadow-sm transition hover:bg-indigo-50 focus:outline-none focus:ring-2 focus:ring-indigo-200 disabled:cursor-not-allowed disabled:opacity-50"
+            type="button"
+            :disabled="isRendering || isRenderingDfa"
+            title="Build a DFA from the Glushkov position NFA via subset construction (shown below after first use)"
+            @click="runSubsetConstruction"
+          >
+            <span
+              v-if="isRenderingDfa"
+              class="inline-block h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent"
+              aria-hidden="true"
+            />
+            <span>Subset → DFA</span>
+          </button>
         </div>
       </div>
 
       <div class="mt-6 rounded-lg bg-white p-5 shadow">
         <div class="mb-2">
-          <p class="text-sm font-semibold text-gray-700">Preprocess: SSF / SNF</p>
-          <p class="text-xs text-gray-500 mt-0.5">Rewrite current input and write result back. SSF = strict star form; SNF = star normal form.</p>
+          <p class="text-sm font-semibold text-gray-700">Preprocess (optional)</p>
+          <p class="text-xs text-gray-500 mt-0.5">Rewrite current input and write back. Convert uses raw parse + positions unless you apply these first. ACI = algebraic reduce; SSF / SNF as below.</p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
+          <button
+            class="rounded-lg border border-slate-600 bg-slate-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-700"
+            type="button"
+            @click="applyAlgebraicReduceToInput"
+          >
+            ACI
+          </button>
           <button
             class="rounded-lg border border-amber-600 bg-amber-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-600"
             type="button"
@@ -121,7 +142,7 @@
         <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p class="text-sm font-semibold text-gray-700">Visualization</p>
-            <p class="text-xs text-gray-500">Switch among 9 constructions from the paper. A_POS uses SNF internally.</p>
+            <p class="text-xs text-gray-500">Switch among 9 constructions from the paper. Algebraic reduce is optional (ACI button).</p>
           </div>
           <div class="flex flex-wrap gap-2">
             <button
@@ -154,6 +175,34 @@
               <div class="flex items-center gap-3 rounded-full bg-white px-4 py-2 shadow">
                 <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-teal-600 border-t-transparent"></span>
                 <span class="text-xs font-semibold text-teal-700">Loading...</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div
+          v-if="showSubsetDfaPanel"
+          class="mt-4 rounded-lg border border-indigo-100 bg-indigo-50/40 px-3 py-4"
+        >
+          <p class="text-sm font-semibold text-gray-800">DFA (subset construction)</p>
+          <p class="text-xs text-gray-600 mt-1">
+            Each node is one DFA state (a subset of Glushkov NFA positions). The graph includes a
+            <code class="text-[11px]">start</code>
+            arrow to the initial subset. Not shown until you use the purple button above.
+          </p>
+          <div class="relative mt-3 min-h-[240px] overflow-auto rounded-lg border border-indigo-100 bg-white px-2 py-3">
+            <div
+              ref="dfaVizContainer"
+              class="min-h-[220px]"
+              aria-label="Subset-construction DFA"
+            />
+            <div
+              v-if="isRenderingDfa"
+              class="absolute inset-0 flex items-center justify-center bg-white/70"
+              aria-live="polite"
+            >
+              <div class="flex items-center gap-3 rounded-full bg-white px-4 py-2 shadow">
+                <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent"></span>
+                <span class="text-xs font-semibold text-indigo-700">Building DFA...</span>
               </div>
             </div>
           </div>
@@ -219,11 +268,14 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, nextTick, onMounted, ref } from 'vue';
 
 const regexInput = ref('(a+b)*a');
-const examples = ['(a+b)*a', '(a*b)*', '(b+ab)*+b*', 'a*b*a*', '(a+b)c*', '(a+b)*'];
+const examples = ['(a+b)*a', '(a*b)*', '(b+ab)*+b*', 'a*b*a*', '(a+b)c*', '(a+b)*', '∅'];
 const vizContainer = ref(null);
+const dfaVizContainer = ref(null);
+const isRenderingDfa = ref(false);
+const showSubsetDfaPanel = ref(false);
 const isRendering = ref(false);
 const errorMessage = ref('');
 const activeTab = ref('apos');
@@ -267,6 +319,8 @@ const tokenize = (input) => {
       }
     } else if (ch === '_') {
       tokens.push({ type: 'eps', value: 'ε' });
+    } else if (ch === '∅' || ch === 'Ø') {
+      tokens.push({ type: 'empty', value: '∅' });
     } else if (isSymbolChar(ch)) {
       tokens.push({ type: 'sym', value: ch });
     } else if (['+', '*', '(', ')'].includes(ch)) {
@@ -555,12 +609,192 @@ const formatFollowSetLabel = (setRef, posMap) => {
   return `{${entries.map((p) => formatPositionWithSymbol(p, posMap)).join(', ')}}`;
 };
 
+/** Unicode epsilon for NFA edges; must match subset-construction scanner. */
+const NFA_EPS = '\u03F5';
+
+const buildGlushkovNfaFromPos = (pos, posMap) => {
+  const ids = pos.states && pos.states.length ? pos.states : [0];
+  const maxId = Math.max(...ids, 0);
+  const nodes = [];
+  for (let i = 0; i <= maxId; i += 1) {
+    const isFinal = pos.finals.has(i);
+    let type = '';
+    if (i === 0) {
+      type = isFinal ? 'accept' : 'start';
+    } else {
+      type = isFinal ? 'accept' : '';
+    }
+    nodes.push({ id: i, type, edges: [] });
+  }
+  for (let i = 0; i <= maxId; i += 1) {
+    const targets = pos.follow.get(i) || new Set();
+    targets.forEach((j) => {
+      const label = posMap[j];
+      if (label != null && nodes[j]) {
+        nodes[i].edges.push([String(label), nodes[j]]);
+      }
+    });
+  }
+  return nodes[0];
+};
+
+const nfaToDfa = (nfa) => {
+  const getClosure = (nodeList) => {
+    const closure = [];
+    const stack = [];
+    const symbols = [];
+    let type = '';
+    for (let i = 0; i < nodeList.length; i += 1) {
+      stack.push(nodeList[i]);
+      closure.push(nodeList[i]);
+      if (nodeList[i].type === 'accept') {
+        type = 'accept';
+      }
+    }
+    while (stack.length > 0) {
+      const top = stack.pop();
+      for (let i = 0; i < top.edges.length; i += 1) {
+        const e = top.edges[i];
+        if (e[0] === NFA_EPS) {
+          if (closure.indexOf(e[1]) < 0) {
+            stack.push(e[1]);
+            closure.push(e[1]);
+            if (e[1].type === 'accept') {
+              type = 'accept';
+            }
+          }
+        } else if (symbols.indexOf(e[0]) < 0) {
+          symbols.push(e[0]);
+        }
+      }
+    }
+    closure.sort((a, b) => a.id - b.id);
+    symbols.sort();
+    return {
+      key: closure.map((x) => x.id).join(','),
+      items: closure,
+      symbols,
+      type,
+      edges: [],
+      trans: {},
+    };
+  };
+
+  const getClosedMove = (closure, symbol) => {
+    const nexts = [];
+    for (let i = 0; i < closure.items.length; i += 1) {
+      const node = closure.items[i];
+      for (let j = 0; j < node.edges.length; j += 1) {
+        if (symbol === node.edges[j][0]) {
+          if (nexts.indexOf(node.edges[j][1]) < 0) {
+            nexts.push(node.edges[j][1]);
+          }
+        }
+      }
+    }
+    return getClosure(nexts);
+  };
+
+  const toAlphaCount = (n) => {
+    const a = 'A'.charCodeAt(0);
+    const z = 'Z'.charCodeAt(0);
+    const len = z - a + 1;
+    let s = '';
+    let x = n;
+    while (x >= 0) {
+      s = String.fromCharCode((x % len) + a) + s;
+      x = Math.floor(x / len) - 1;
+    }
+    return s;
+  };
+
+  const first = getClosure([nfa]);
+  const states = {};
+  const queue = [first];
+  let front = 0;
+  let count = 0;
+  first.id = toAlphaCount(count);
+  states[first.key] = first;
+
+  while (front < queue.length) {
+    const top = queue[front];
+    front += 1;
+    for (let i = 0; i < top.symbols.length; i += 1) {
+      const sym = top.symbols[i];
+      const closure = getClosedMove(top, sym);
+      if (!Object.prototype.hasOwnProperty.call(states, closure.key)) {
+        count += 1;
+        closure.id = toAlphaCount(count);
+        states[closure.key] = closure;
+        queue.push(closure);
+      }
+      top.trans[sym] = states[closure.key];
+      top.edges.push([sym, states[closure.key]]);
+    }
+  }
+  return first;
+};
+
+const collectDfaStatesFromFirst = (first) => {
+  const out = [];
+  const seen = new Set();
+  const q = [first];
+  seen.add(first.key);
+  while (q.length) {
+    const s = q.shift();
+    out.push(s);
+    for (let i = 0; i < s.edges.length; i += 1) {
+      const tgt = s.edges[i][1];
+      if (!seen.has(tgt.key)) {
+        seen.add(tgt.key);
+        q.push(tgt);
+      }
+    }
+  }
+  return out;
+};
+
+const buildSubsetDfaDot = (first, regexLabel) => {
+  const states = collectDfaStatesFromFirst(first);
+  const esc = (s) => String(s).replace(/"/g, '\\"');
+  const nodeDecl = states
+    .map((s) => {
+      const per = s.type === 'accept' ? ' peripheries=2' : '';
+      return `  "${esc(s.id)}" [label="${esc(s.id)}"${per}];`;
+    })
+    .join('\n');
+  const edgeSet = new Set();
+  const edgeLines = [];
+  states.forEach((s) => {
+    s.edges.forEach(([lab, tgt]) => {
+      const k = `${s.id}->${tgt.id}|${lab}`;
+      if (edgeSet.has(k)) return;
+      edgeSet.add(k);
+      edgeLines.push(`  "${esc(s.id)}" -> "${esc(tgt.id)}" [label="${esc(lab)}"];`);
+    });
+  });
+  const title = regexLabel || 'ε';
+  return `
+digraph {
+  rankdir=LR;
+  labelloc="t";
+  label="DFA (subset construction) for: ${esc(title)}";
+  fontsize=14;
+  node [shape=circle, style=filled, fillcolor="#e8eaf6", color="#3949ab", fontcolor="#1a237e"];
+  edge [color="#283593", penwidth=2, arrowsize=0.8];
+${nodeDecl}
+  start [shape=point, color="#3949ab"];
+  start -> "${esc(first.id)}";
+${edgeLines.join('\n')}
+}
+`;
+};
+
 const baseBuild = (regex) => {
   const tokens = tokenize(regex);
   const postfix = toPostfix(tokens);
   const astRaw = buildAst(postfix);
-  const astFinal = reduceRegexByAxioms(astRaw);
-  const { node: ast, posMap } = markPositions(astFinal);
+  const { node: ast, posMap } = markPositions(astRaw);
   const pos = buildPositionAutomaton(ast);
   const nfaData = nullableFirstLast(ast);
   const alphabet = Array.from(new Set(Object.values(posMap)));
@@ -683,6 +917,8 @@ const buildFollowDot = (regex, pos, posMap, nfaData) => {
       edges.push(`  "${s.key}" -> "${k}" [label="${Array.from(syms).join(', ')}"];`);
     });
   });
+  const startFollow = states.find((s) => s.i === 0);
+  const startFollowKey = startFollow ? startFollow.key.replace(/"/g, '\\"') : '';
   return `
 digraph {
   rankdir=LR;
@@ -692,6 +928,8 @@ digraph {
   node [shape=ellipse, style=filled, fillcolor="#fff3e0", color="#fb8c00", fontcolor="#e65100"];
   edge [color="#ef6c00", penwidth=2, arrowsize=0.8];
 ${nodeLines}
+  start [shape=point, color="#fb8c00"];
+  start -> "${startFollowKey}";
 ${edges.join('\n')}
 }
 `;
@@ -924,6 +1162,7 @@ const buildPdDot = (regex, ast, alphabet) => {
   const nodeLines = nodes
     .map((n) => `  "${n.k}" [label="${n.k}"${n.final ? ' peripheries=2' : ''}];`)
     .join('\n');
+  const pdStartKey = pdKey(startSet).replace(/"/g, '\\"');
   return `
 digraph {
   rankdir=LR;
@@ -933,6 +1172,8 @@ digraph {
   node [shape=box, style=filled, fillcolor="#f3e5f5", color="#8e24aa", fontcolor="#4a148c"];
   edge [color="#6a1b9a", penwidth=2, arrowsize=0.8];
 ${nodeLines}
+  start [shape=point, color="#8e24aa"];
+  start -> "${pdStartKey}";
 ${edges.join('\n')}
 }
 `;
@@ -1333,6 +1574,7 @@ const buildBrzDot = (regex, ast, alphabet) => {
     })
     .join('\n');
 
+  const skEsc = startKey.replace(/"/g, '\\"');
   return `
 digraph {
   rankdir=LR;
@@ -1341,9 +1583,9 @@ digraph {
   fontsize=14;
   node [shape=box, style=filled, fillcolor="#e8f5e9", color="#2e7d32", fontcolor="#1b5e20"];
   edge [color="#1b5e20", penwidth=2, arrowsize=0.8];
-  
-  "${startKey}" [style="filled,bold", color="#1b5e20", fillcolor="#c8e6c9"];
-  
+  start [shape=point, color="#2e7d32"];
+  start -> "${skEsc}";
+  "${skEsc}" [style="filled,bold", color="#1b5e20", fillcolor="#c8e6c9"];
 ${nodeLines}
 ${edges.join('\n')}
 }
@@ -1587,18 +1829,27 @@ const getDotForTab = (tab, expr, data) => {
   }
 };
 
-const getReducedAstFromInput = () => {
+const getParsedAstFromInput = () => {
   const expr = regexInput.value.trim() || 'ε';
   const tokens = tokenize(expr);
   const postfix = toPostfix(tokens);
-  const astRaw = buildAst(postfix);
-  return reduceRegexByAxioms(astRaw);
+  return buildAst(postfix);
+};
+
+const applyAlgebraicReduceToInput = () => {
+  errorMessage.value = '';
+  try {
+    const ast = getParsedAstFromInput();
+    regexInput.value = astToString(reduceRegexByAxioms(ast));
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : 'Parse error';
+  }
 };
 
 const applySSFToInput = () => {
   errorMessage.value = '';
   try {
-    const ast = getReducedAstFromInput();
+    const ast = getParsedAstFromInput();
     const out = toSSF(ast);
     regexInput.value = astToString(reduceRegexByAxioms(out));
   } catch (err) {
@@ -1609,7 +1860,7 @@ const applySSFToInput = () => {
 const applySNFToInput = () => {
   errorMessage.value = '';
   try {
-    const ast = getReducedAstFromInput();
+    const ast = getParsedAstFromInput();
     const out = toSNF(ast);
     regexInput.value = astToString(reduceRegexByAxioms(out));
   } catch (err) {
@@ -2110,6 +2361,30 @@ const renderActive = async (expression, tab = activeTab.value) => {
     console.error(err);
   } finally {
     isRendering.value = false;
+  }
+};
+
+const runSubsetConstruction = async () => {
+  showSubsetDfaPanel.value = true;
+  await nextTick();
+  if (!dfaVizContainer.value) return;
+  isRenderingDfa.value = true;
+  errorMessage.value = '';
+  try {
+    const expr = regexInput.value.trim() || 'ε';
+    const data = baseBuild(expr);
+    const nfaStart = buildGlushkovNfaFromPos(data.pos, data.posMap);
+    const dfaFirst = nfaToDfa(nfaStart);
+    const dot = buildSubsetDfaDot(dfaFirst, expr);
+    const svg = await renderDotWithWorker(dot);
+    dfaVizContainer.value.innerHTML = svg;
+  } catch (err) {
+    errorMessage.value =
+      err instanceof Error ? err.message : 'Unable to build subset DFA.';
+    dfaVizContainer.value.innerHTML = '';
+    console.error(err);
+  } finally {
+    isRenderingDfa.value = false;
   }
 };
 
