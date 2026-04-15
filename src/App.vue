@@ -94,8 +94,8 @@
           <button
             class="inline-flex min-w-[13.5rem] shrink-0 items-center justify-center gap-2 rounded-lg border-2 border-indigo-600 bg-white px-5 py-3 text-sm font-semibold uppercase tracking-wide text-indigo-700 shadow-sm transition hover:bg-indigo-50 focus:outline-none focus:ring-2 focus:ring-indigo-200 disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
-            :disabled="isRendering || isRenderingDfa"
-            title="Build a DFA from the Glushkov position NFA via subset construction (shown below after first use)"
+            :disabled="isRendering || isRenderingDfa || !canRunSubsetOnActiveTab"
+            :title="canRunSubsetOnActiveTab ? `Subset construction from current tab (${activeTab})` : `Subset construction is enabled for A_POS / AF / A_PD / A_Dual_POS.`"
             @click="runSubsetConstruction"
           >
             <span
@@ -103,7 +103,7 @@
               class="inline-block h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent"
               aria-hidden="true"
             />
-            <span>Subset → DFA</span>
+            <span>{{ canRunSubsetOnActiveTab ? "Subset → DFA" : "Subset N/A" }}</span>
           </button>
         </div>
       </div>
@@ -183,7 +183,7 @@
           v-if="showSubsetDfaPanel"
           class="mt-4 rounded-lg border border-indigo-100 bg-indigo-50/40 px-3 py-4"
         >
-          <p class="text-sm font-semibold text-gray-800">DFA (subset construction)</p>
+          <p class="text-sm font-semibold text-gray-800">DFA (subset construction from {{ subsetSourceTab }})</p>
           <p class="text-xs text-gray-600 mt-1">
             Each node is one DFA state (a subset of Glushkov NFA positions). The graph includes a
             <code class="text-[11px]">start</code>
@@ -279,13 +279,16 @@ const showSubsetDfaPanel = ref(false);
 const isRendering = ref(false);
 const errorMessage = ref('');
 const activeTab = ref('apos');
+const subsetSourceTab = ref('apos');
+const subsetEligibleTabs = new Set(['apos', 'follow', 'pd', 'dpos']);
+const canRunSubsetOnActiveTab = computed(() => subsetEligibleTabs.has(activeTab.value));
 
 const automatonTabs = [
   { key: 'apos', label: 'A_POS (NFA)' },
   { key: 'follow', label: 'AF (Follow)' },
   { key: 'my', label: 'A_MY (McNaughton-Yamada)' },
   { key: 'mb', label: 'A_MB (Mark Before)' },
-  { key: 'pd', label: 'A_PD (Partial Deriv.)' },
+  { key: 'pd', label: 'A_PD (Partial Deriv. NFA)' },
   { key: 'brz', label: 'A_B (Brzozowski)' },
   { key: 'pref', label: 'A_Pre (Prefix)' },
   { key: 'dpos', label: 'A_Dual_POS' },
@@ -754,6 +757,49 @@ const collectDfaStatesFromFirst = (first) => {
   return out;
 };
 
+const splitEdgeLabels = (label) => {
+  if (!label) return [];
+  return String(label)
+    .split(',')
+    .map((x) => x.trim())
+    .filter((x) => x.length > 0);
+};
+
+const buildNfaFromParsedGraph = (graph) => {
+  const nodeEntries = Array.from(graph.nodes.values());
+  const nodeMap = new Map();
+  nodeEntries.forEach((n, idx) => {
+    nodeMap.set(n.id, { id: idx, type: n.accept ? 'accept' : '', edges: [] });
+  });
+
+  const edgeSet = new Set();
+  graph.edges.forEach((e) => {
+    const fromNode = nodeMap.get(e.from);
+    const toNode = nodeMap.get(e.to);
+    if (!fromNode || !toNode) return;
+    splitEdgeLabels(e.label).forEach((lab) => {
+      const key = `${fromNode.id}->${toNode.id}|${lab}`;
+      if (edgeSet.has(key)) return;
+      edgeSet.add(key);
+      fromNode.edges.push([lab, toNode]);
+    });
+  });
+
+  const startNode = { id: -1, type: 'start', edges: [] };
+  const initialIds = Array.from(graph.initial || []);
+  if (initialIds.length === 0) {
+    const firstId = nodeEntries.length ? nodeEntries[0].id : null;
+    const tgt = firstId != null ? nodeMap.get(firstId) : null;
+    if (tgt) startNode.edges.push([NFA_EPS, tgt]);
+  } else {
+    initialIds.forEach((id) => {
+      const tgt = nodeMap.get(id);
+      if (tgt) startNode.edges.push([NFA_EPS, tgt]);
+    });
+  }
+  return startNode;
+};
+
 const buildSubsetDfaDot = (first, regexLabel) => {
   const states = collectDfaStatesFromFirst(first);
   const esc = (s) => String(s).replace(/"/g, '\\"');
@@ -1122,52 +1168,49 @@ const pd = (node, sym) => {
   return [];
 };
 
-const pdKey = (nodes) => {
-  const strs = nodes.map((n) => astToString(n));
-  const uniq = Array.from(new Set(strs)).sort();
-  return uniq.length ? `{${uniq.join(', ')}}` : '∅';
-};
+const pdNodeKey = (node) => astToString(node);
 
 const buildPdDot = (regex, ast, alphabet) => {
-  const startSet = [ast];
-  const queue = [startSet];
-  const visited = new Set([pdKey(startSet)]);
+  const start = reduceRegexByAxioms(cloneAst(ast));
+  const startKey = pdNodeKey(start);
+  const queue = [startKey];
+  const stateMap = new Map([[startKey, start]]);
   const edges = [];
-  const nodes = [];
   while (queue.length) {
-    const cur = queue.shift();
-    const curKey = pdKey(cur);
-    const isFinal = cur.some((n) => isNullable(n));
-    nodes.push({ k: curKey, final: isFinal });
+    const curKey = queue.shift();
+    const cur = stateMap.get(curKey);
+    if (!cur) continue;
     alphabet.forEach((sym) => {
-      const next = [];
-      cur.forEach((n) => {
-        next.push(...pd(n, sym));
-      });
-      if (!next.length) return;
-      const nk = pdKey(next);
-      edges.push(`  "${curKey}" -> "${nk}" [label="${sym}"];`);
-      if (edges.length > MAX_AUTOMATON_EDGES) {
-        throw new Error('Automaton too large.');
-      }
-      if (!visited.has(nk)) {
-        visited.add(nk);
-        if (visited.size > MAX_AUTOMATON_STATES) {
+      const nextNodes = pd(cur, sym).map((n) => reduceRegexByAxioms(n));
+      if (!nextNodes.length) return;
+      const targets = new Set();
+      nextNodes.forEach((n) => {
+        const nk = pdNodeKey(n);
+        if (targets.has(nk)) return;
+        targets.add(nk);
+        edges.push(`  "${curKey}" -> "${nk}" [label="${sym}"];`);
+        if (edges.length > MAX_AUTOMATON_EDGES) {
           throw new Error('Automaton too large.');
         }
-        queue.push(next);
-      }
+        if (!stateMap.has(nk)) {
+          stateMap.set(nk, n);
+          if (stateMap.size > MAX_AUTOMATON_STATES) {
+            throw new Error('Automaton too large.');
+          }
+          queue.push(nk);
+        }
+      });
     });
   }
-  const nodeLines = nodes
-    .map((n) => `  "${n.k}" [label="${n.k}"${n.final ? ' peripheries=2' : ''}];`)
+  const nodeLines = Array.from(stateMap.entries())
+    .map(([k, node]) => `  "${k}" [label="${k}"${isNullable(node) ? ' peripheries=2' : ''}];`)
     .join('\n');
-  const pdStartKey = pdKey(startSet).replace(/"/g, '\\"');
+  const pdStartKey = startKey.replace(/"/g, '\\"');
   return `
 digraph {
   rankdir=LR;
   labelloc="t";
-  label="A_PD (partial derivatives) for: ${regex.replace(/"/g, '\\"')}";
+  label="A_PD (partial derivatives NFA) for: ${regex.replace(/"/g, '\\"')}";
   fontsize=14;
   node [shape=box, style=filled, fillcolor="#f3e5f5", color="#8e24aa", fontcolor="#4a148c"];
   edge [color="#6a1b9a", penwidth=2, arrowsize=0.8];
@@ -2365,17 +2408,30 @@ const renderActive = async (expression, tab = activeTab.value) => {
 };
 
 const runSubsetConstruction = async () => {
+  if (!canRunSubsetOnActiveTab.value) {
+    errorMessage.value = 'Subset construction is enabled for A_POS / AF / A_PD / A_Dual_POS.';
+    return;
+  }
   showSubsetDfaPanel.value = true;
+  subsetSourceTab.value = activeTab.value;
   await nextTick();
   if (!dfaVizContainer.value) return;
   isRenderingDfa.value = true;
   errorMessage.value = '';
   try {
     const expr = regexInput.value.trim() || 'ε';
-    const data = baseBuild(expr);
-    const nfaStart = buildGlushkovNfaFromPos(data.pos, data.posMap);
+    if (parsedCache.value.expr !== expr) {
+      parsedCache.value = parseExpression(expr);
+      dotByType.value = {};
+      svgByType.value = {};
+    }
+    if (!dotByType.value[activeTab.value]) {
+      dotByType.value[activeTab.value] = getDotForTab(activeTab.value, expr, parsedCache.value.data);
+    }
+    const graph = parseDotToGraph(dotByType.value[activeTab.value]);
+    const nfaStart = buildNfaFromParsedGraph(graph);
     const dfaFirst = nfaToDfa(nfaStart);
-    const dot = buildSubsetDfaDot(dfaFirst, expr);
+    const dot = buildSubsetDfaDot(dfaFirst, `${expr} [${activeTab.value}]`);
     const svg = await renderDotWithWorker(dot);
     dfaVizContainer.value.innerHTML = svg;
   } catch (err) {
