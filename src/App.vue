@@ -189,20 +189,44 @@
             <code class="text-[11px]">start</code>
             arrow to the initial subset. Not shown until you use the purple button above.
           </p>
-          <div class="relative mt-3 min-h-[240px] overflow-auto rounded-lg border border-indigo-100 bg-white px-2 py-3">
-            <div
-              ref="dfaVizContainer"
-              class="min-h-[220px]"
-              aria-label="Subset-construction DFA"
-            />
-            <div
-              v-if="isRenderingDfa"
-              class="absolute inset-0 flex items-center justify-center bg-white/70"
-              aria-live="polite"
-            >
-              <div class="flex items-center gap-3 rounded-full bg-white px-4 py-2 shadow">
-                <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent"></span>
-                <span class="text-xs font-semibold text-indigo-700">Building DFA...</span>
+          <div class="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_19rem]">
+            <div class="relative min-h-[240px] overflow-auto rounded-lg border border-indigo-100 bg-white px-2 py-3">
+              <div
+                ref="dfaVizContainer"
+                class="min-h-[220px]"
+                aria-label="Subset-construction DFA"
+              />
+              <div
+                v-if="isRenderingDfa"
+                class="absolute inset-0 flex items-center justify-center bg-white/70"
+                aria-live="polite"
+              >
+                <div class="flex items-center gap-3 rounded-full bg-white px-4 py-2 shadow">
+                  <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent"></span>
+                  <span class="text-xs font-semibold text-indigo-700">Building DFA...</span>
+                </div>
+              </div>
+            </div>
+            <div class="rounded-lg border border-indigo-100 bg-white p-3">
+              <p class="text-xs font-semibold uppercase tracking-wide text-indigo-700">Subset States</p>
+              <div class="mt-2 max-h-[280px] overflow-auto pr-1">
+                <p v-if="!subsetStateRows.length" class="text-xs text-gray-500">Run subset construction to list state subsets.</p>
+                <ul v-else class="space-y-2">
+                  <li
+                    v-for="row in subsetStateRows"
+                    :key="row.id"
+                    class="rounded-md border border-indigo-100 bg-indigo-50/50 px-2 py-1.5 text-xs text-gray-700"
+                  >
+                    <span class="font-semibold text-indigo-700">{{ row.id }}</span>
+                    <span class="ml-1">term={{ formatTermSet(row.terms) }}</span>
+                    <span
+                      v-if="row.isFinal"
+                      class="ml-1 rounded-full bg-indigo-100 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-700"
+                    >
+                      accept
+                    </span>
+                  </li>
+                </ul>
               </div>
             </div>
           </div>
@@ -276,6 +300,7 @@ const vizContainer = ref(null);
 const dfaVizContainer = ref(null);
 const isRenderingDfa = ref(false);
 const showSubsetDfaPanel = ref(false);
+const subsetStateRows = ref([]);
 const isRendering = ref(false);
 const errorMessage = ref('');
 const activeTab = ref('apos');
@@ -673,11 +698,15 @@ const nfaToDfa = (nfa) => {
     }
     closure.sort((a, b) => a.id - b.id);
     symbols.sort();
+    const termTokens = sortTermTokens(
+      closure.flatMap((node) => (Array.isArray(node.termTokens) ? node.termTokens : [])),
+    );
     return {
       key: closure.map((x) => x.id).join(','),
       items: closure,
       symbols,
       type,
+      termTokens,
       edges: [],
       trans: {},
     };
@@ -757,6 +786,34 @@ const collectDfaStatesFromFirst = (first) => {
   return out;
 };
 
+const sortTermTokens = (tokens) => {
+  const uniq = Array.from(new Set(tokens.filter((x) => x != null && `${x}`.trim() !== '')));
+  return uniq.sort((a, b) => {
+    const na = Number(a);
+    const nb = Number(b);
+    const aNum = Number.isFinite(na);
+    const bNum = Number.isFinite(nb);
+    if (aNum && bNum) return na - nb;
+    if (aNum) return -1;
+    if (bNum) return 1;
+    return String(a).localeCompare(String(b));
+  });
+};
+
+const formatTermSet = (terms) => {
+  if (!terms || terms.length === 0) return '∅';
+  return `{${terms.join(', ')}}`;
+};
+
+const buildSubsetStateRows = (first) => {
+  const states = collectDfaStatesFromFirst(first);
+  return states.map((s) => ({
+    id: s.id,
+    terms: s.termTokens || [],
+    isFinal: s.type === 'accept',
+  }));
+};
+
 const splitEdgeLabels = (label) => {
   if (!label) return [];
   return String(label)
@@ -766,10 +823,30 @@ const splitEdgeLabels = (label) => {
 };
 
 const buildNfaFromParsedGraph = (graph) => {
+  const extractTermTokens = (label, fallbackId) => {
+    const raw = `${label || ''}`;
+    const out = [];
+    const subMatches = raw.match(/_(\d+)/g) || [];
+    subMatches.forEach((m) => out.push(m.slice(1)));
+    if (!out.length) {
+      const digits = raw.match(/\b\d+\b/g) || [];
+      digits.forEach((d) => out.push(d));
+    }
+    if (!out.length && /^\d+$/.test(`${fallbackId}`)) {
+      out.push(`${fallbackId}`);
+    }
+    return sortTermTokens(out);
+  };
+
   const nodeEntries = Array.from(graph.nodes.values());
   const nodeMap = new Map();
   nodeEntries.forEach((n, idx) => {
-    nodeMap.set(n.id, { id: idx, type: n.accept ? 'accept' : '', edges: [] });
+    nodeMap.set(n.id, {
+      id: idx,
+      type: n.accept ? 'accept' : '',
+      edges: [],
+      termTokens: extractTermTokens(n.label, n.id),
+    });
   });
 
   const edgeSet = new Set();
@@ -785,7 +862,7 @@ const buildNfaFromParsedGraph = (graph) => {
     });
   });
 
-  const startNode = { id: -1, type: 'start', edges: [] };
+  const startNode = { id: -1, type: 'start', edges: [], termTokens: [] };
   const initialIds = Array.from(graph.initial || []);
   if (initialIds.length === 0) {
     const firstId = nodeEntries.length ? nodeEntries[0].id : null;
@@ -806,7 +883,9 @@ const buildSubsetDfaDot = (first, regexLabel) => {
   const nodeDecl = states
     .map((s) => {
       const per = s.type === 'accept' ? ' peripheries=2' : '';
-      return `  "${esc(s.id)}" [label="${esc(s.id)}"${per}];`;
+      const termLabel = formatTermSet(s.termTokens || []);
+      const label = `${s.id}\\nterm: ${termLabel}`;
+      return `  "${esc(s.id)}" [label="${esc(label)}"${per}];`;
     })
     .join('\n');
   const edgeSet = new Set();
@@ -2418,6 +2497,7 @@ const runSubsetConstruction = async () => {
   if (!dfaVizContainer.value) return;
   isRenderingDfa.value = true;
   errorMessage.value = '';
+  subsetStateRows.value = [];
   try {
     const expr = regexInput.value.trim() || 'ε';
     if (parsedCache.value.expr !== expr) {
@@ -2431,12 +2511,14 @@ const runSubsetConstruction = async () => {
     const graph = parseDotToGraph(dotByType.value[activeTab.value]);
     const nfaStart = buildNfaFromParsedGraph(graph);
     const dfaFirst = nfaToDfa(nfaStart);
+    subsetStateRows.value = buildSubsetStateRows(dfaFirst);
     const dot = buildSubsetDfaDot(dfaFirst, `${expr} [${activeTab.value}]`);
     const svg = await renderDotWithWorker(dot);
     dfaVizContainer.value.innerHTML = svg;
   } catch (err) {
     errorMessage.value =
       err instanceof Error ? err.message : 'Unable to build subset DFA.';
+    subsetStateRows.value = [];
     dfaVizContainer.value.innerHTML = '';
     console.error(err);
   } finally {
