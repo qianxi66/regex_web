@@ -827,14 +827,25 @@ const buildNfaFromParsedGraph = (graph) => {
   const extractTermTokens = (label, fallbackId) => {
     const raw = `${label || ''}`;
     const out = [];
+    // Pattern 1: positional subscripts like a_1, b_2  (AF / Follow automaton)
     const subMatches = raw.match(/_(\d+)/g) || [];
     subMatches.forEach((m) => out.push(m.slice(1)));
+    // Pattern 2: bare integers  (A_POS, A_Dual_POS)
     if (!out.length) {
       const digits = raw.match(/\b\d+\b/g) || [];
       digits.forEach((d) => out.push(d));
     }
+    // Pattern 3: numeric fallbackId
     if (!out.length && /^\d+$/.test(`${fallbackId}`)) {
       out.push(`${fallbackId}`);
+    }
+    // Pattern 4: expression-labeled states (A_PD, Hitch subset)
+    // When the label is a regex expression like "(a+b)*a" or "ε", use it verbatim.
+    if (!out.length) {
+      const trimmed = raw.trim();
+      if (trimmed && trimmed !== '∅') {
+        out.push(trimmed);
+      }
     }
     return sortTermTokens(out);
   };
