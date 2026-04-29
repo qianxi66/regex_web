@@ -95,7 +95,7 @@
             class="inline-flex min-w-[13.5rem] shrink-0 items-center justify-center gap-2 rounded-lg border-2 border-indigo-600 bg-white px-5 py-3 text-sm font-semibold uppercase tracking-wide text-indigo-700 shadow-sm transition hover:bg-indigo-50 focus:outline-none focus:ring-2 focus:ring-indigo-200 disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             :disabled="isRendering || isRenderingDfa || !canRunSubsetOnActiveTab"
-            :title="canRunSubsetOnActiveTab ? `Subset construction from current tab (${activeTab})` : `Subset construction is enabled for A_POS / AF / A_PD / A_Dual_POS.`"
+            :title="canRunSubsetOnActiveTab ? `Subset construction from current tab (${activeTab})` : `Subset construction is enabled for A_POS / AF / A_PD / A_Dual_POS / Hitch.`"
             @click="runSubsetConstruction"
           >
             <span
@@ -305,7 +305,7 @@ const isRendering = ref(false);
 const errorMessage = ref('');
 const activeTab = ref('apos');
 const subsetSourceTab = ref('apos');
-const subsetEligibleTabs = new Set(['apos', 'follow', 'pd', 'dpos']);
+const subsetEligibleTabs = new Set(['apos', 'follow', 'pd', 'dpos', 'hitch']);
 const canRunSubsetOnActiveTab = computed(() => subsetEligibleTabs.has(activeTab.value));
 
 const automatonTabs = [
@@ -318,6 +318,7 @@ const automatonTabs = [
   { key: 'pref', label: 'A_Pre (Prefix)' },
   { key: 'dpos', label: 'A_Dual_POS' },
   { key: 'dpref', label: 'A_Dual_Pre' },
+  { key: 'hitch', label: 'Hitch (ε-follow)' },
 ];
 
 // --- Regex parsing and automata construction ---
@@ -1925,6 +1926,136 @@ ${edges.join('\n')}
 `;
 };
 
+// ── Hitch (ε-follow / optimised NFA) ─────────────────────────────────────────
+// Implements the ε-follow construction with state-merging:
+//   union  → merge start₁+start₂, merge final₁+final₂  (saves 2 states)
+//   concat → merge final₁ with start₂                   (saves 1 state)
+//   star   → add one new q_new (start=final), plus 2 ε edges
+//   atom   → 2 states, 1 transition (same as Thompson)
+const buildHitchNfa = (ast) => {
+  let counter = 0;
+  // stateMap: id → { id, edges:[{label,target}], mergedInto:id|null }
+  const stateMap = new Map();
+  const newState = () => {
+    const id = counter++;
+    stateMap.set(id, { id, edges: [], mergedInto: null });
+    return id;
+  };
+  const resolve = (id) => {
+    let cur = id;
+    while (stateMap.get(cur).mergedInto !== null) cur = stateMap.get(cur).mergedInto;
+    return cur;
+  };
+  // Merge bId into aId: aId stays canonical, bId becomes an alias
+  const mergeInto = (aId, bId) => {
+    const ra = resolve(aId);
+    const rb = resolve(bId);
+    if (ra === rb) return ra;
+    const a = stateMap.get(ra);
+    const b = stateMap.get(rb);
+    b.edges.forEach((e) => a.edges.push(e));
+    b.edges = [];
+    b.mergedInto = ra;
+    return ra;
+  };
+  const build = (node) => {
+    if (!node || node.kind === 'empty') {
+      return { start: newState(), final: newState() };
+    }
+    if (node.kind === 'eps') {
+      const s = newState();
+      const f = newState();
+      stateMap.get(s).edges.push({ label: NFA_EPS, target: f });
+      return { start: s, final: f };
+    }
+    if (node.kind === 'sym') {
+      const s = newState();
+      const f = newState();
+      stateMap.get(s).edges.push({ label: node.sym, target: f });
+      return { start: s, final: f };
+    }
+    if (node.kind === 'union') {
+      const n1 = build(node.left);
+      const n2 = build(node.right);
+      return {
+        start: mergeInto(n1.start, n2.start),
+        final: mergeInto(n1.final, n2.final),
+      };
+    }
+    if (node.kind === 'concat') {
+      const n1 = build(node.left);
+      const n2 = build(node.right);
+      mergeInto(n1.final, n2.start); // junction: n1.final absorbs n2.start
+      return { start: resolve(n1.start), final: resolve(n2.final) };
+    }
+    if (node.kind === 'star') {
+      const nb = build(node.child);
+      const qNew = newState();
+      stateMap.get(qNew).edges.push({ label: NFA_EPS, target: resolve(nb.start) });
+      stateMap.get(resolve(nb.final)).edges.push({ label: NFA_EPS, target: qNew });
+      return { start: qNew, final: qNew };
+    }
+    return { start: newState(), final: newState() };
+  };
+  const root = build(ast);
+  return { stateMap, start: resolve(root.start), final: resolve(root.final), resolve };
+};
+
+const buildHitchDot = (regex, ast) => {
+  const { stateMap, start, final, resolve } = buildHitchNfa(ast);
+  // BFS over active (non-merged) states
+  const visited = new Set();
+  const queue = [start];
+  visited.add(start);
+  while (queue.length) {
+    const curId = queue.shift();
+    stateMap.get(curId).edges.forEach((e) => {
+      const tgt = resolve(e.target);
+      if (!visited.has(tgt)) { visited.add(tgt); queue.push(tgt); }
+    });
+  }
+  // Display ids: start → 0, rest in BFS order
+  const displayId = new Map();
+  let dc = 0;
+  displayId.set(start, dc++);
+  visited.forEach((id) => { if (!displayId.has(id)) displayId.set(id, dc++); });
+
+  const nodeLines = [];
+  const edgeLines = [];
+  const edgeSet = new Set();
+  visited.forEach((id) => {
+    const dId = displayId.get(id);
+    const per = id === final ? ' peripheries=2' : '';
+    nodeLines.push(`  ${dId} [label="${dId}"${per}];`);
+    stateMap.get(id).edges.forEach((e) => {
+      const tgt = resolve(e.target);
+      const tDId = displayId.get(tgt);
+      if (tDId === undefined) return;
+      const ek = `${dId}->${tDId}|${e.label}`;
+      if (edgeSet.has(ek)) return;
+      edgeSet.add(ek);
+      // Use NFA_EPS as label so the subset-construction pipeline can parse ε edges
+      edgeLines.push(`  ${dId} -> ${tDId} [label="${e.label}"];`);
+    });
+  });
+  const startDId = displayId.get(start);
+  return `
+digraph {
+  rankdir=LR;
+  labelloc="t";
+  label="Hitch (ε-follow NFA) for: ${regex.replace(/"/g, '\\"')}";
+  fontsize=14;
+  node [shape=circle, style=filled, fillcolor="#fce4ec", color="#c62828", fontcolor="#b71c1c"];
+  edge [color="#b71c1c", penwidth=2, arrowsize=0.8];
+${nodeLines.join('\n')}
+  start [shape=point, color="#c62828"];
+  start -> ${startDId};
+${edgeLines.join('\n')}
+}
+`;
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 const getDotForTab = (tab, expr, data) => {
   const { ast, posMap, pos, nfaData, alphabet } = data;
   switch (tab) {
@@ -1946,6 +2077,8 @@ const getDotForTab = (tab, expr, data) => {
       return buildDualPosDot(expr, pos, posMap, nfaData);
     case 'dpref':
       return buildDualPrefixDot(expr, ast, alphabet);
+    case 'hitch':
+      return buildHitchDot(expr, ast);
     default:
       return buildPosDot(expr, pos, posMap).dot;
   }
